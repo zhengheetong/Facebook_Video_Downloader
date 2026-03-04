@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
             val fbUrl = urlInput.text.toString().trim()
             if (fbUrl.isNotEmpty()) {
                 Toast.makeText(this, "Extracting video data...", Toast.LENGTH_SHORT).show()
-                extractFacebookVideo(fbUrl)
+                extractFacebookVideo(fbUrl) // <--- Pointing back to the API!
             } else {
                 Toast.makeText(this, "Please enter a valid Facebook link", Toast.LENGTH_SHORT).show()
             }
@@ -63,17 +63,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractFacebookVideo(videoUrl: String) {
-        val apiUrl = "https://${ApiConfig.RAPID_API_HOST}/get_media"
+        // Encode the URL so the API can read it safely
+        val encodedUrl = java.net.URLEncoder.encode(videoUrl, "UTF-8")
+        val apiUrl = "https://${ApiConfig.RAPID_API_HOST}/external-api/facebook-video-downloader?url=$encodedUrl"
 
-        // 1. Package the URL into a JSON body format exactly like the cURL data
-        val jsonPayload = """{"url":"$videoUrl"}"""
+        // Send an empty JSON body as required by this specific API
+        val jsonPayload = "{}"
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val requestBody = jsonPayload.toRequestBody(mediaType)
 
-        // 2. Build the POST request
         val request = Request.Builder()
             .url(apiUrl)
-            .post(requestBody) // Send the JSON body
+            .post(requestBody)
             .addHeader("x-rapidapi-host", ApiConfig.RAPID_API_HOST)
             .addHeader("x-rapidapi-key", ApiConfig.RAPID_API_KEY)
             .build()
@@ -89,20 +90,21 @@ class MainActivity : AppCompatActivity() {
                 if (response.isSuccessful) {
                     val responseBody = response.body?.string()
 
-                    // IMPORTANT: Log the raw response so we can see what the API hands back!
-                    println("API_RESPONSE_DATA: $responseBody")
-
                     try {
                         val jsonObject = JSONObject(responseBody!!)
+                        val linksObject = jsonObject.getJSONObject("links")
 
-                        // TEMPORARY: We need to see the JSON structure in Logcat to know the exact key.
-                        // I'm assuming it might be 'url' or 'video' for now.
-                        val videoLink = jsonObject.getString("direct_media_url")
+                        // Smart Selection: Try High Quality first, fallback to Low Quality
+                        val videoLink = if (linksObject.has("Download High Quality")) {
+                            linksObject.getString("Download High Quality")
+                        } else {
+                            linksObject.getString("Download Low Quality")
+                        }
 
                         downloadAndSaveVideo(videoLink)
                     } catch (e: Exception) {
                         runOnUiThread {
-                            Toast.makeText(this@MainActivity, "Failed to parse API data. Check Logcat!", Toast.LENGTH_LONG).show()
+                            Toast.makeText(this@MainActivity, "Failed to parse API data.", Toast.LENGTH_LONG).show()
                         }
                     }
                 } else {
@@ -120,15 +122,18 @@ class MainActivity : AppCompatActivity() {
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
+                    downloadButton.text = "Download Video"
+                    downloadButton.isEnabled = true
                     Toast.makeText(this@MainActivity, "Failed to download MP4", Toast.LENGTH_LONG).show()
                 }
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
-                    val inputStream = response.body?.byteStream()
+                    val body = response.body
+                    val contentLength = body?.contentLength() ?: -1L
+                    val inputStream = body?.byteStream()
 
-                    // Save to the Downloads/FB_Downloader folder
                     val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                     val customDir = File(downloadsDir, "FB_Downloader")
                     if (!customDir.exists()) customDir.mkdirs()
@@ -137,17 +142,52 @@ class MainActivity : AppCompatActivity() {
                     val file = File(customDir, fileName)
                     val outputStream = FileOutputStream(file)
 
-                    inputStream?.copyTo(outputStream)
+                    // The New Engine: Download chunk by chunk!
+                    val buffer = ByteArray(4096)
+                    var bytesCopied = 0L
+                    var bytesRead: Int
+                    var lastProgress = -1
+
+                    // Disable the button so the user can't spam it
+                    runOnUiThread {
+                        downloadButton.isEnabled = false
+                    }
+
+                    while (inputStream?.read(buffer).also { bytesRead = it ?: -1 } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        bytesCopied += bytesRead
+
+                        // Calculate percentage and update the UI
+                        if (contentLength > 0) {
+                            val progress = ((bytesCopied * 100) / contentLength).toInt()
+
+                            // Only update the UI if the percentage actually changed (prevents lag)
+                            if (progress != lastProgress) {
+                                lastProgress = progress
+                                runOnUiThread {
+                                    downloadButton.text = "Downloading... $progress%"
+                                }
+                            }
+                        } else {
+                            // If the API hides the file size, just show MB downloaded
+                            val mbDownloaded = bytesCopied / (1024 * 1024)
+                            runOnUiThread {
+                                downloadButton.text = "Downloading... ${mbDownloaded}MB"
+                            }
+                        }
+                    }
+
                     outputStream.close()
                     inputStream?.close()
 
                     runOnUiThread {
-                        Toast.makeText(this@MainActivity, "ARCHIVED: Saved to Gallery", Toast.LENGTH_LONG).show()
+                        // Reset the button
+                        downloadButton.text = "Download Video"
+                        downloadButton.isEnabled = true
 
-                        // Tell the UI to update the list immediately!
+                        Toast.makeText(this@MainActivity, "ARCHIVED: Saved to Gallery", Toast.LENGTH_LONG).show()
                         refreshHistory()
 
-                        // Instantly ping the Android Gallery to index the new video!
                         MediaScannerConnection.scanFile(
                             this@MainActivity,
                             arrayOf(file.absolutePath),
@@ -161,56 +201,102 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshHistory() {
-        historyContainer.removeAllViews()
-        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val customDir = File(downloadsDir, "FB_Downloader")
+        runOnUiThread {
+            historyContainer.removeAllViews()
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val customDir = File(downloadsDir, "FB_Downloader")
 
-        if (customDir.exists()) {
-            val files = customDir.listFiles()?.sortedByDescending { it.lastModified() }
+            if (!customDir.exists() || customDir.listFiles().isNullOrEmpty()) {
+                val emptyText = TextView(this)
+                emptyText.text = "No recent downloads."
+                emptyText.setTextColor(android.graphics.Color.parseColor("#B0B3B8"))
+                historyContainer.addView(emptyText)
+                return@runOnUiThread
+            }
 
-            files?.forEach { file ->
-                val textView = TextView(this).apply {
-                    text = "▶ ${file.name}" // Added a play icon!
-                    setTextColor(android.graphics.Color.parseColor("#E4E6EB"))
-                    setPadding(0, 24, 0, 24) // Added a bit more padding for easier finger tapping
-                    textSize = 15f
+            val files = customDir.listFiles()?.filter { it.extension == "mp4" }?.sortedByDescending { it.lastModified() } ?: return@runOnUiThread
+            val dateFormat = java.text.SimpleDateFormat("MMM dd, yyyy • HH:mm", java.util.Locale.getDefault())
 
-                    // THE NEW UPGRADE: Make the text clickable!
-                    setOnClickListener {
-                        showVideoDialog(file)
-                    }
+            // Automatically calculate the perfect thumbnail size for the user's screen
+            val imageSize = (80 * resources.displayMetrics.density).toInt()
+            val marginEnd = (16 * resources.displayMetrics.density).toInt()
+
+            for (file in files) {
+                // 1. Create a Horizontal Container (The Card)
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setBackgroundColor(android.graphics.Color.parseColor("#242526"))
+                    setPadding(40, 40, 40, 40)
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+
+                    val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                    params.setMargins(0, 0, 0, 20)
+                    layoutParams = params
+
+                    // The entire card remains clickable
+                    setOnClickListener { playVideoInApp(file.absolutePath) }
                 }
-                historyContainer.addView(textView)
+
+                // 2. Create the Thumbnail Image Block
+                val thumbnailView = android.widget.ImageView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(imageSize, imageSize).apply {
+                        setMargins(0, 0, marginEnd, 0) // Keep it separated from the text
+                    }
+                    scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
+                    setBackgroundColor(android.graphics.Color.parseColor("#18191A")) // Dark loading placeholder
+                }
+
+                // 3. Extract the Video Frame in the Background! (Prevents lag)
+                Thread {
+                    try {
+                        val retriever = android.media.MediaMetadataRetriever()
+                        retriever.setDataSource(file.absolutePath)
+                        // Grab a high-quality frame at the 1-second mark
+                        val bitmap = retriever.getFrameAtTime(1000000, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        retriever.release()
+
+                        // Push the finished image back to the main screen
+                        if (bitmap != null) {
+                            runOnUiThread { thumbnailView.setImageBitmap(bitmap) }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }.start()
+
+                // 4. Create the Text Block (I removed the play icon since we have a picture now!)
+                val textView = TextView(this).apply {
+                    val dateString = dateFormat.format(java.util.Date(file.lastModified()))
+                    text = "${file.name}\n$dateString"
+                    setTextColor(android.graphics.Color.parseColor("#E4E6EB"))
+                    textSize = 14f
+                }
+
+                // 5. Assemble the Card and put it on the screen
+                card.addView(thumbnailView)
+                card.addView(textView)
+                historyContainer.addView(card)
             }
         }
     }
 
-    private fun showVideoDialog(videoFile: File) {
-        // Create a fullscreen black dialog
-        val dialog = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-
-        // Initialize the video player and controls
+    private fun playVideoInApp(videoPath: String) {
+        val dialog = android.app.Dialog(this)
         val videoView = android.widget.VideoView(this)
         val mediaController = android.widget.MediaController(this)
 
-        // Attach the controls to the video player
         mediaController.setAnchorView(videoView)
         videoView.setMediaController(mediaController)
-        videoView.setVideoPath(videoFile.absolutePath)
+        videoView.setVideoPath(videoPath)
 
-        // Make the video player fill the screen
         val layoutParams = android.view.ViewGroup.LayoutParams(
             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT // This keeps it as a neat popup!
         )
+        videoView.layoutParams = layoutParams
 
-        dialog.setContentView(videoView, layoutParams)
-
-        // Auto-play the video as soon as it loads
-        videoView.setOnPreparedListener {
-            it.start()
-        }
-
+        dialog.setContentView(videoView)
         dialog.show()
+        videoView.start()
     }
 }
